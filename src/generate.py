@@ -17,21 +17,22 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
+from __future__ import annotations
 
 import json
 import logging
 import random
 import re
 import xml.etree.ElementTree as ET
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from shutil import copy, move, rmtree
+from shutil import copy, rmtree
 from subprocess import run
 from typing import Any, Callable, Dict, List, NamedTuple, Tuple
 from xml.etree.ElementTree import Element
 from zipfile import ZipFile
 
 import cv2
-from numpy.typing import ArrayLike
 from tqdm.auto import tqdm
 
 RE_FILES = re.compile(r"Output written to .+\/(.+\_[0-9]+\.svg)\.")
@@ -51,6 +52,27 @@ class BoundingBox(NamedTuple):
     y: int
     w: int
     h: int
+
+    def merge(self, other: BoundingBox) -> BoundingBox:
+        """Merge two bounding boxes into one that overlaps both.
+
+        Parameters
+        ----------
+        other : BoundingBox
+            Another bounding box element.
+
+        Returns
+        -------
+        BoundingBox
+            The combined bounding box.
+        """
+        new_x = min(self.x, other.x)
+        new_y = min(self.y, other.y)
+
+        new_w = max(self.x + self.w, other.x + other.w) - new_x
+        new_h = max(self.y + self.h, other.y + other.h) - new_y
+
+        return BoundingBox(new_x, new_y, new_w, new_h)
 
 
 class VerovioError(Exception):
@@ -105,7 +127,7 @@ class MeasureGenerator:
     def _open_zip(path: Path) -> Any:
         with ZipFile(path) as f_zip:
             file_list = f_zip.namelist()
-            logging.debug(f"Loading {file_list[-1]} from within the MXML file")
+            logging.debug("Loading %s from within the MXML file", file_list[-1])
             xml_file = f_zip.open(file_list[-1], "r")
         return ET.parse(xml_file)
 
@@ -135,16 +157,17 @@ class MeasureGenerator:
         except VerovioError:
             print(f"Could not generate a verovio score from {str(self._ipath)}")
             logging.info(
-                f"Verovio failed to produce a meaningful output for File "
-                f"{str(self._ipath)}. Skipping..."
+                "Verovio failed to produce a meaningful output for File "
+                "%s. Skipping...",
+                str(self._ipath),
             )
             rmtree(output_path)
-        except Exception as e:
-            print(f"Unknown error: {repr(e)}")
+        except ValueError as exc:
+            print(f"Unknown error: {repr(exc)}")
             rmtree(output_path)
 
         print(f"Done! Produced {len(pages)} pages of music")
-        logging.info(f"Verovio produced {len(pages)} pages.")
+        logging.info("Verovio produced %i pages.", len(pages))
         nstaves = self._get_staves(mxml)
 
         print("Processing page measures...")
@@ -155,15 +178,14 @@ class MeasureGenerator:
                 )
                 feedback += curr_fb
                 written += current_w
-        except Exception as e:
-            print(f"Exception found while processing page: {repr(e)}")
-            logging.info(f"Problem while processing page {repr(e)}. Skipping...")
+        except ValueError as exc:
+            logging.info("Problem while processing page %s. Skipping...", repr(exc))
             rmtree(output_path)
         print("Done!")
 
     def _process_page_svg(
         self, input_file: Path, staff_info: Dict, output_folder: Path, base_fname: str
-    ) -> Tuple[List[str], List[str]]:
+    ) -> Tuple[List[Tuple[str, str]], List[str]]:
         """Crop a page input into measure-level images.
 
         :param input_file: Path to an SVG page.
@@ -188,34 +210,48 @@ class MeasureGenerator:
 
         conversor = self._produce_conversor(canvas_size, img_size)
 
-        staff_coordinates = self._find_staff_coordinates(svg_xml)
+        base_staff_coordinates = self._find_staff_coordinates(svg_xml)
+        staff_coordinates = self._merge_staves(base_staff_coordinates, index2part)
         staff_coordinates = self._expand_staves(staff_coordinates, canvas_height)
         staff_coordinates = {k: conversor(v) for k, v in staff_coordinates.items()}
 
         leftmost_measures = self._find_leftmost(staff_coordinates)
 
         for k, coord in staff_coordinates.items():
-            measure_number, staff_number = k
-            part_id = index2part[staff_number]
-            system_staff = staff_info[part_id]["part_indices"].index(staff_number) + 1
+            part_id, measure_id = k
+            # system_staff = staff_info[part_id]["part_indices"].index(staff_number) + 1
             crop = png_img[coord.y : coord.y + coord.h, coord.x : coord.x + coord.w, :]
-            fname = default_measure_fname(
-                base_fname, part_id, measure_number, system_staff
-            )
+            fname = f"{base_fname}_p{part_id}_m{measure_id}.png"
             cv2.imwrite(str(output_folder / fname), crop)
             written.append(fname)
 
             if k in leftmost_measures:
-                feedback.append(fname)
+                feedback.append(k)
 
         return feedback, written
 
+    def _merge_staves(
+        self,
+        staff_coordinates: Dict[Tuple[str, int], BoundingBox],
+        index2part: Dict[int, str],
+    ) -> Dict[Tuple[str, str], BoundingBox]:
+        output: Dict[Tuple[str, str], BoundingBox] = {}
+
+        for ident, bbox in staff_coordinates.items():
+            measure_part = (index2part[ident[1]], ident[0])
+            if measure_part in output:
+                output[measure_part] = output[measure_part].merge(bbox)
+            else:
+                output[measure_part] = bbox
+
+        return output
+
     def _expand_staves(
         self,
-        coordinates: Dict[Tuple[str, int], BoundingBox],
+        coordinates: Dict[Tuple[str, str], BoundingBox],
         page_height: int,
-        factor: float = 1.0,
-    ) -> Dict[Tuple[str, int], BoundingBox]:
+        factor: float = 0.25,
+    ) -> Dict[Tuple[str, str], BoundingBox]:
         """Expand measures vertically to an arbitrary size.
 
         :param coordinates: A dictionary with measure and staff ids as key and
@@ -226,18 +262,33 @@ class MeasureGenerator:
         :returns: Adjusted bboxes to span the maximum amount of space possible.
         """
         output = {}
+        y1values = sorted(
+            list(set(bbox.y for bbox in coordinates.values())) + [page_height]
+        )
+        y2values = sorted(
+            [0] + list(set(bbox.y + bbox.h for bbox in coordinates.values()))
+        )
+
+        yconv = dict(zip(y1values[:-1], y2values[:-1]))
+        hconv = {
+            oldy: end - start
+            for oldy, start, end in zip(y1values[:-1], y2values[:-1], y1values[1:])
+        }
+
         for key, coord in coordinates.items():
-            mod_factor = factor + ((random.random() - 0.5) * 0.33)
-            new_y = max(0, coord.y - int(mod_factor * coord.h))
-            mod_factor = factor + ((random.random() - 0.5) * 0.33)
-            new_h = min(page_height - new_y, int(coord.h + 2 * mod_factor * coord.h))
-            output[key] = BoundingBox(coord.x, new_y, coord.w, new_h)
+            output[key] = BoundingBox(
+                x=coord.x - 720,
+                y=yconv[coord.y],
+                w=coord.w + (2 * 720),
+                h=hconv[coord.y],
+            )
+
         return output
 
     def _find_leftmost(
         self,
-        staff_info: Dict[Tuple[str, int], BoundingBox],
-    ) -> List[Tuple[int, int]]:
+        staff_info: Dict[Tuple[str, str], BoundingBox],
+    ) -> List[Tuple[str, str]]:
         """Find measures that lie on the left margin of the page.
 
         :param staff_info: A Dictionary whose keys are the measure and staff ids in
@@ -267,10 +318,16 @@ class MeasureGenerator:
             for staff in staves:
                 staff_index = int(staff.attrib["data-n"])
 
-                staff_lines = staff.findall("./svg:path", NAMESPACES)
+                staff_lines_svg = staff.findall("./svg:path", NAMESPACES)
+                staff_lines_mch = [
+                    RE_LINE_COMMAND.match(line.attrib["d"]) for line in staff_lines_svg
+                ]
+                assert all(
+                    map(lambda x: x is not None, staff_lines_mch)
+                ), "Invalid path in staff line definition"
+
                 staff_lines = [
-                    tuple(map(int, RE_LINE_COMMAND.match(line.attrib["d"]).groups()))
-                    for line in staff_lines
+                    tuple(map(int, matches.groups())) for matches in staff_lines_mch
                 ]
                 xcoords = [y for x in staff_lines for y in x[::2]]
                 ycoords = [y for x in staff_lines for y in x[1::2]]
@@ -306,17 +363,17 @@ class MeasureGenerator:
         :raises VerovioError: If verovio fails to generate anything.
         """
         command = self._svg_command(file_path, page_path / f"{file_path.stem}.svg")
-        command_output = run(command, capture_output=True)
+        command_output = run(command, capture_output=True, check=False)
 
         if command_output.returncode != 0:
             raise VerovioError(
                 "Verovio failed to produce an output", command_output.stderr
             )
 
-        command_output = command_output.stderr.decode("utf-8").split("\n")
+        fnames = command_output.stderr.decode("utf-8").split("\n")
         pages = [
             x.group(1)
-            for x in [RE_FILES.match(line) for line in command_output]
+            for x in [RE_FILES.match(line) for line in fnames]
             if x is not None
         ]
         return pages
@@ -333,11 +390,11 @@ class MeasureGenerator:
         of the given part under the "nstaves" key and a list of assigned indices
         under the "staves" key.
         """
-        part_list = xml_tree.find("part-list")
-        if part_list is None:
+        part_list_elm = xml_tree.find("part-list")
+        if part_list_elm is None:
             raise ValueError("The MusicXML file has no part-list available.")
         part_list = [
-            x.attrib["id"] for ii, x in enumerate(part_list.findall("score-part"))
+            x.attrib["id"] for ii, x in enumerate(part_list_elm.findall("score-part"))
         ]
 
         part_elements = xml_tree.findall("part")
@@ -377,8 +434,8 @@ class MeasureGenerator:
         scale_obj = svg_xml.find('.//svg:svg[@class="definition-scale"]', NAMESPACES)
         if scale_obj is None:
             raise ValueError("No scale object found within output SVG")
-        view_box = scale_obj.attrib["viewBox"]
-        view_box = tuple(map(int, view_box.split(" ")))[2:]
+        view_box_elm = scale_obj.attrib["viewBox"]
+        view_box = tuple(map(int, view_box_elm.split(" ")))[2:]
 
         return view_box
 
@@ -393,7 +450,7 @@ class MeasureGenerator:
         """
         output_file = input_file.parent / (input_file.stem + ".png")
         command = ["inkscape", str(input_file), "-o", str(output_file)]
-        _ = run(command, capture_output=True)
+        _ = run(command, capture_output=True, check=False)
         png_img = cv2.imread(str(output_file), cv2.IMREAD_UNCHANGED)
         png_img[png_img[:, :, 3] == 0] = [255, 255, 255, 255]
         png_img = cv2.cvtColor(png_img, cv2.COLOR_BGRA2BGR)
@@ -498,9 +555,9 @@ class MeasureGenerator:
             and added to PATH.
         """
         try:
-            run(["verovio", "-h base"], capture_output=True)
-        except FileNotFoundError:
-            raise VerovioNotFoundError("Verovio is not installed on the system.")
+            run(["verovio", "-h base"], capture_output=True, check=False)
+        except FileNotFoundError as exc:
+            raise exc from VerovioNotFoundError
 
     @staticmethod
     def _probe_inkscape() -> None:
@@ -513,8 +570,42 @@ class MeasureGenerator:
             and added to PATH.
         """
         try:
-            run(["inkscape", "--help"], capture_output=True)
+            run(["inkscape", "--help"], capture_output=True, check=False)
         except FileNotFoundError as exc:
             raise InkscapeNotFoundError(
                 "Inkscape is not installed on the system."
             ) from exc
+
+
+def main(args: Namespace) -> None:
+    generator = MeasureGenerator(args.source, args.target, args.hfactor)
+    generator.generate()
+
+
+def setup() -> Namespace:
+    parser = ArgumentParser()
+
+    parser.add_argument(
+        "source",
+        type=Path,
+        help="Path to the MXML file to raster.",
+    )
+    parser.add_argument(
+        "target",
+        type=Path,
+        help="Target directory where all files will be stored",
+    )
+
+    parser.add_argument(
+        "--hfactor",
+        type=float,
+        help="Factor by which to scale horizontally.",
+        default=0.1,
+    )
+
+    args = parser.parse_args()
+    return args
+
+
+if __name__ == "__main__":
+    main(setup())
