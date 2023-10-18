@@ -181,6 +181,8 @@ class MeasureGenerator:
         except ValueError as exc:
             logging.info("Problem while processing page %s. Skipping...", repr(exc))
             rmtree(output_path)
+        with open(output_path / "feedback.json", "w", encoding="utf-8") as f_fb:
+            json.dump(feedback, f_fb)
         print("Done!")
 
     def _process_page_svg(
