@@ -214,7 +214,11 @@ class MeasureGenerator:
 
         base_staff_coordinates = self._find_staff_coordinates(svg_xml)
         staff_coordinates = self._merge_staves(base_staff_coordinates, index2part)
-        staff_coordinates = self._expand_staves(staff_coordinates, canvas_height)
+        staff_coordinates = self._expand_staves(
+            staff_coordinates,
+            canvas_height,
+            canvas_width,
+        )
         staff_coordinates = {k: conversor(v) for k, v in staff_coordinates.items()}
 
         leftmost_measures = self._find_leftmost(staff_coordinates)
@@ -252,7 +256,7 @@ class MeasureGenerator:
         self,
         coordinates: Dict[Tuple[str, str], BoundingBox],
         page_height: int,
-        factor: float = 0.25,
+        page_width: int,
     ) -> Dict[Tuple[str, str], BoundingBox]:
         """Expand measures vertically to an arbitrary size.
 
@@ -279,9 +283,9 @@ class MeasureGenerator:
 
         for key, coord in coordinates.items():
             output[key] = BoundingBox(
-                x=coord.x - 720,
+                x=max(0, coord.x - 720),
                 y=yconv[coord.y],
-                w=coord.w + (2 * 720),
+                w=min(page_width, coord.w + (2 * 720)),
                 h=hconv[coord.y],
             )
 
