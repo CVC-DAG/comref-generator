@@ -9,5 +9,8 @@ printf -v mxmlFiles "%s " /home/ptorras/Documents/Datasets/COMREF/Originals/Musi
 
 for x in $mxmlFiles
 do
-    python3 generate.py $x /home/ptorras/Documents/Datasets/COMREF_06
+    if ! python3 generate.py "$x" /home/ptorras/Documents/Datasets/COMREF_06;
+    then
+        echo "$x" >> failed.txt
+    fi
 done
